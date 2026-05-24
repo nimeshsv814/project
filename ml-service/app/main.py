@@ -2,7 +2,6 @@ import os
 from functools import lru_cache
 
 import joblib
-import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
@@ -47,30 +46,44 @@ class IncidentSummaryRequest(BaseModel):
 @lru_cache(maxsize=1)
 def load_bundle():
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(
-            f'Model bundle not found at {MODEL_PATH}. Run scripts/train_model.py first.'
-        )
-    return joblib.load(MODEL_PATH)
+        return None
+    try:
+        return joblib.load(MODEL_PATH)
+    except Exception:
+        # Keep service available even when optional ML runtime deps are absent.
+        return None
 
 
-def to_dataframe(payload: PredictionRequest):
-    return pd.DataFrame(
-        [
-            {
-                'memory_change': payload.memory_change,
-                'cpu_change': payload.cpu_change,
-                'commits': payload.commits,
-                'helm_changes': payload.helm_changes,
-                'node_usage': payload.node_usage,
-                'pod_restart': payload.pod_restart,
-                'latency': payload.latency,
-                'previous_failures': payload.previous_failures,
-                'incidents': payload.incidents,
-                'files_changed': payload.files_changed,
-                'loc_changed': payload.loc_changed,
-            }
-        ]
-    )
+def model_features(payload: PredictionRequest):
+    return [
+        payload.memory_change,
+        payload.cpu_change,
+        payload.commits,
+        payload.helm_changes,
+        payload.node_usage,
+        payload.pod_restart,
+        payload.latency,
+        payload.previous_failures,
+        payload.incidents,
+        payload.files_changed,
+        payload.loc_changed,
+    ]
+
+
+def fallback_probability(payload: PredictionRequest) -> float:
+    score = 0.0
+    score += max(0.0, payload.memory_change) * 0.20
+    score += max(0.0, payload.cpu_change) * 0.20
+    score += min(payload.commits / 40.0, 1.0) * 12.0
+    score += min(payload.helm_changes / 20.0, 1.0) * 10.0
+    score += min(payload.node_usage / 100.0, 1.0) * 18.0
+    score += min(payload.pod_restart / 10.0, 1.0) * 14.0
+    score += min(payload.latency / 1000.0, 1.0) * 16.0
+    score += min(payload.previous_failures / 10.0, 1.0) * 4.0
+    score += min(payload.incidents / 10.0, 1.0) * 4.0
+    score += min(payload.files_changed / 200.0, 1.0) * 1.0
+    score += min(payload.loc_changed / 1000.0, 1.0) * 1.0
+    return max(1.0, min(score, 99.0))
 
 
 @app.get('/health')
@@ -81,10 +94,11 @@ def health():
 @app.post('/predict')
 def predict(payload: PredictionRequest):
     bundle = load_bundle()
-    model = bundle['model']
-
-    df = to_dataframe(payload)
-    probability = float(model.predict_proba(df)[0][1]) * 100.0
+    if bundle and 'model' in bundle:
+        model = bundle['model']
+        probability = float(model.predict_proba([model_features(payload)])[0][1]) * 100.0
+    else:
+        probability = fallback_probability(payload)
     rounded_probability = round(probability, 2)
 
     reasons = build_reasons(payload)
