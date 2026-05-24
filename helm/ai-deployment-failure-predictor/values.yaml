@@ -1,0 +1,61 @@
+namespace: aiops
+
+backend:
+  replicas: 2
+  image:
+    repository: youracr.azurecr.io/aiops-backend
+    tag: latest
+    pullPolicy: Always
+  service:
+    port: 5000
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 600m
+      memory: 768Mi
+
+frontend:
+  replicas: 2
+  image:
+    repository: youracr.azurecr.io/aiops-frontend
+    tag: latest
+    pullPolicy: Always
+  service:
+    port: 80
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 256Mi
+
+mlService:
+  replicas: 2
+  image:
+    repository: youracr.azurecr.io/aiops-ml-service
+    tag: latest
+    pullPolicy: Always
+  service:
+    port: 8000
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  cpuUtilization: 65
+  memoryUtilization: 70
+
+ingress:
+  enabled: true
+  className: azure/application-gateway
+  host: aiops.example.com

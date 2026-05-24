@@ -1,0 +1,26 @@
+{
+  "deploymentId": "deploy-001",
+  "name": "payment-release-2026.05.24",
+  "service": "payment-service",
+  "git": {
+    "commitCount": 12,
+    "filesChanged": 35,
+    "locChanged": 1280
+  },
+  "kubernetes": {
+    "cpuRequest": 0.5,
+    "cpuLimit": 1.0,
+    "memoryRequest": 512,
+    "memoryLimit": 1024,
+    "helmChanges": 4
+  },
+  "history": {
+    "previousFailures": 2,
+    "incidents": 1
+  },
+  "monitoring": {
+    "nodeUtilization": 84,
+    "latency": 430,
+    "podRestarts": 3
+  }
+}

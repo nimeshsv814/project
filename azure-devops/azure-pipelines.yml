@@ -1,0 +1,194 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  azureServiceConnection: 'YOUR-AZURE-SERVICE-CONNECTION'
+  aksResourceGroup: 'YOUR-AKS-RG'
+  aksClusterName: 'YOUR-AKS-CLUSTER'
+  acrName: 'youracr'
+  imageTag: '$(Build.BuildId)'
+  namespace: 'aiops'
+  releaseName: 'aiops'
+  gatekeeperApiBaseUrl: 'https://your-gatekeeper-api.example.com'
+
+stages:
+  - stage: Build
+    displayName: Build and Test
+    jobs:
+      - job: BuildAndPush
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+            displayName: Use Node.js 20
+
+          - script: |
+              cd backend
+              npm ci
+              node --check src/server.js
+            displayName: Validate backend syntax
+
+          - script: |
+              cd frontend
+              npm ci
+              npm run build
+            displayName: Build frontend
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.11'
+            displayName: Use Python 3.11
+
+          - script: |
+              cd ml-service
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+              python scripts/generate_synthetic_data.py --rows 3000
+              python scripts/train_model.py
+            displayName: Train ML model
+
+          - task: AzureCLI@2
+            displayName: Build and push container images
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az acr login --name $(acrName)
+
+                docker build -t $(acrName).azurecr.io/aiops-backend:$(imageTag) backend
+                docker build -t $(acrName).azurecr.io/aiops-frontend:$(imageTag) frontend
+                docker build -t $(acrName).azurecr.io/aiops-ml-service:$(imageTag) ml-service
+
+                docker push $(acrName).azurecr.io/aiops-backend:$(imageTag)
+                docker push $(acrName).azurecr.io/aiops-frontend:$(imageTag)
+                docker push $(acrName).azurecr.io/aiops-ml-service:$(imageTag)
+
+  - stage: AIRiskAnalysis
+    displayName: AI Risk Analysis
+    dependsOn: Build
+    jobs:
+      - job: RiskGate
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - script: |
+              set -euo pipefail
+              sudo apt-get update
+              sudo apt-get install -y jq
+
+              DEPLOYMENT_ID=$(jq -r '.deploymentId' azure-devops/deployment-metadata.json)
+              TOKEN="$(API_AUTH_TOKEN)"
+
+              RESPONSE=$(curl -sS -X POST "$(gatekeeperApiBaseUrl)/api/deployment/check" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"deploymentId\":\"$DEPLOYMENT_ID\"}")
+
+              echo "$RESPONSE"
+
+              SCORE=$(echo "$RESPONSE" | jq -r '.failureProbability')
+              DECISION=$(echo "$RESPONSE" | jq -r '.decision')
+
+              echo "##vso[task.setvariable variable=RISK_SCORE;isOutput=true]$SCORE"
+              echo "##vso[task.setvariable variable=RISK_DECISION;isOutput=true]$DECISION"
+
+              if [ "$DECISION" = "pause" ]; then
+                echo "High risk deployment. Stopping pipeline."
+                exit 1
+              fi
+            displayName: Invoke gatekeeper
+            name: GateResult
+
+  - stage: Approval
+    displayName: Manual Approval (Medium Risk)
+    dependsOn: AIRiskAnalysis
+    condition: eq(stageDependencies.AIRiskAnalysis.RiskGate.outputs['GateResult.RISK_DECISION'], 'approval_required')
+    jobs:
+      - job: ApprovalWait
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: 'devops-team@contoso.com'
+              instructions: 'Risk is medium (50-80). Review and approve deployment.'
+              onTimeout: reject
+
+  - stage: Deploy
+    displayName: Deploy to AKS
+    dependsOn:
+      - AIRiskAnalysis
+      - Approval
+    condition: |
+      or(
+        eq(stageDependencies.AIRiskAnalysis.RiskGate.outputs['GateResult.RISK_DECISION'], 'deploy'),
+        and(
+          eq(stageDependencies.AIRiskAnalysis.RiskGate.outputs['GateResult.RISK_DECISION'], 'approval_required'),
+          succeeded('Approval')
+        )
+      )
+    jobs:
+      - job: HelmDeploy
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: HelmInstaller@1
+            inputs:
+              helmVersionToInstall: 'latest'
+
+          - task: AzureCLI@2
+            displayName: Deploy helm release
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                az aks get-credentials \
+                  --resource-group $(aksResourceGroup) \
+                  --name $(aksClusterName) \
+                  --overwrite-existing
+
+                helm upgrade --install $(releaseName) helm/ai-deployment-failure-predictor \
+                  --namespace $(namespace) \
+                  --create-namespace \
+                  --set backend.image.repository=$(acrName).azurecr.io/aiops-backend \
+                  --set backend.image.tag=$(imageTag) \
+                  --set frontend.image.repository=$(acrName).azurecr.io/aiops-frontend \
+                  --set frontend.image.tag=$(imageTag) \
+                  --set mlService.image.repository=$(acrName).azurecr.io/aiops-ml-service \
+                  --set mlService.image.tag=$(imageTag)
+
+                kubectl get pods -n $(namespace)
+
+  - stage: Monitor
+    displayName: Post-Deploy Monitoring
+    dependsOn: Deploy
+    condition: succeeded('Deploy')
+    jobs:
+      - job: MonitorChecks
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - script: |
+              echo "Runbook checks:"
+              echo "1) Validate /health endpoints"
+              echo "2) Observe Grafana dashboard panels"
+              echo "3) Review Azure Monitor alerts for pod restarts, node pressure, and risk spikes"
+            displayName: Monitoring checklist
